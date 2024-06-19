@@ -1,0 +1,1982 @@
+From beaf802567aea8546b4050a9289a8cc6fefce149 Mon Sep 17 00:00:00 2001
+From: Zheng Junjie <zhengjunjie@iscas.ac.cn>
+Date: Wed, 19 Jun 2024 09:57:32 +0800
+Subject: [PATCH] update 3rdparty/backward-cpp
+
+---
+ 3rdparty/backward-cpp/BackwardConfig.cmake | 136 +++--
+ 3rdparty/backward-cpp/CMakeLists.txt       | 119 +++-
+ 3rdparty/backward-cpp/README.md            | 180 ++++--
+ 3rdparty/backward-cpp/backward.cpp         |  12 +-
+ 3rdparty/backward-cpp/backward.hpp         | 631 ++++++++++++++++-----
+ 5 files changed, 831 insertions(+), 247 deletions(-)
+
+diff --git a/3rdparty/backward-cpp/BackwardConfig.cmake b/3rdparty/backward-cpp/BackwardConfig.cmake
+index e8dc3c3d..7f6b3cb1 100644
+--- a/3rdparty/backward-cpp/BackwardConfig.cmake
++++ b/3rdparty/backward-cpp/BackwardConfig.cmake
+@@ -28,6 +28,8 @@ set(STACK_WALKING_UNWIND TRUE CACHE BOOL
+ 	"Use compiler's unwind API")
+ set(STACK_WALKING_BACKTRACE FALSE CACHE BOOL
+ 	"Use backtrace from (e)glibc for stack walking")
++set(STACK_WALKING_LIBUNWIND FALSE CACHE BOOL
++	"Use libunwind for stack walking")
+ 
+ set(STACK_DETAILS_AUTO_DETECT TRUE CACHE BOOL
+ 	"Auto detect backward's stack details dependencies")
+@@ -41,25 +43,63 @@ set(STACK_DETAILS_BFD FALSE CACHE BOOL
+ set(STACK_DETAILS_DWARF FALSE CACHE BOOL
+ 	"Use libdwarf/libelf to read debug info")
+ 
+-if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT DEFINED BACKWARD_TESTS)
+-	# If this is a top level CMake project, we most lixely want the tests
+-	set(BACKWARD_TESTS ON CACHE BOOL "Enable tests")
+-else()
+-	set(BACKWARD_TESTS OFF CACHE BOOL "Enable tests")
+-endif()
+ ###############################################################################
+ # CONFIGS
+ ###############################################################################
+-if (${STACK_DETAILS_AUTO_DETECT})
+-	include(FindPackageHandleStandardArgs)
++include(FindPackageHandleStandardArgs)
++
++if (STACK_WALKING_LIBUNWIND)
++	# libunwind works on the macOS without having to add special include
++	# paths or libraries
++	if (NOT APPLE)
++		find_path(LIBUNWIND_INCLUDE_DIR NAMES "libunwind.h")
++		find_library(LIBUNWIND_LIBRARY unwind)
++
++		if (LIBUNWIND_LIBRARY)
++			include(CheckSymbolExists)
++			check_symbol_exists(UNW_INIT_SIGNAL_FRAME libunwind.h HAVE_UNW_INIT_SIGNAL_FRAME)
++			if (NOT HAVE_UNW_INIT_SIGNAL_FRAME)
++				message(STATUS "libunwind does not support unwinding from signal handler frames")
++			endif()
++		endif()
+ 
++		set(LIBUNWIND_INCLUDE_DIRS ${LIBUNWIND_INCLUDE_DIR})
++		set(LIBDWARF_LIBRARIES ${LIBUNWIND_LIBRARY})
++		find_package_handle_standard_args(libunwind DEFAULT_MSG
++			LIBUNWIND_LIBRARY LIBUNWIND_INCLUDE_DIR)
++		mark_as_advanced(LIBUNWIND_INCLUDE_DIR LIBUNWIND_LIBRARY)
++		list(APPEND _BACKWARD_LIBRARIES ${LIBUNWIND_LIBRARY})
++	endif()
++
++	# Disable other unwinders if libunwind is found
++	set(STACK_WALKING_UNWIND FALSE)
++	set(STACK_WALKING_BACKTRACE FALSE)
++endif()
++
++if (${STACK_DETAILS_AUTO_DETECT})
++	if(NOT CMAKE_VERSION VERSION_LESS 3.17)
++		set(_name_mismatched_arg NAME_MISMATCHED)
++	endif()
+ 	# find libdw
+ 	find_path(LIBDW_INCLUDE_DIR NAMES "elfutils/libdw.h" "elfutils/libdwfl.h")
+ 	find_library(LIBDW_LIBRARY dw)
++	# in case it's statically linked, look for all the possible dependencies
++	find_library(LIBELF_LIBRARY elf)
++	find_library(LIBPTHREAD_LIBRARY pthread)
++	find_library(LIBZ_LIBRARY z)
++	find_library(LIBBZ2_LIBRARY bz2)
++	find_library(LIBLZMA_LIBRARY lzma)
++	find_library(LIBZSTD_LIBRARY zstd)
+ 	set(LIBDW_INCLUDE_DIRS ${LIBDW_INCLUDE_DIR} )
+-	set(LIBDW_LIBRARIES ${LIBDW_LIBRARY} )
+-	find_package_handle_standard_args(libdw DEFAULT_MSG
+-		LIBDW_LIBRARY LIBDW_INCLUDE_DIR)
++	set(LIBDW_LIBRARIES ${LIBDW_LIBRARY}
++		$<$<BOOL:${LIBELF_LIBRARY}>:${LIBELF_LIBRARY}>
++		$<$<BOOL:${LIBPTHREAD_LIBRARY}>:${LIBPTHREAD_LIBRARY}>
++		$<$<BOOL:${LIBZ_LIBRARY}>:${LIBZ_LIBRARY}>
++		$<$<BOOL:${LIBBZ2_LIBRARY}>:${LIBBZ2_LIBRARY}>
++		$<$<BOOL:${LIBLZMA_LIBRARY}>:${LIBLZMA_LIBRARY}>
++		$<$<BOOL:${LIBZSTD_LIBRARY}>:${LIBZSTD_LIBRARY}>)
++	find_package_handle_standard_args(libdw ${_name_mismatched_arg}
++		REQUIRED_VARS LIBDW_LIBRARY LIBDW_INCLUDE_DIR)
+ 	mark_as_advanced(LIBDW_INCLUDE_DIR LIBDW_LIBRARY)
+ 
+ 	# find libbfd
+@@ -69,8 +109,8 @@ if (${STACK_DETAILS_AUTO_DETECT})
+ 	find_library(LIBDL_LIBRARY dl)
+ 	set(LIBBFD_INCLUDE_DIRS ${LIBBFD_INCLUDE_DIR} ${LIBDL_INCLUDE_DIR})
+ 	set(LIBBFD_LIBRARIES ${LIBBFD_LIBRARY} ${LIBDL_LIBRARY})
+-	find_package_handle_standard_args(libbfd DEFAULT_MSG
+-		LIBBFD_LIBRARY LIBBFD_INCLUDE_DIR
++	find_package_handle_standard_args(libbfd ${_name_mismatched_arg}
++		REQUIRED_VARS LIBBFD_LIBRARY LIBBFD_INCLUDE_DIR
+ 		LIBDL_LIBRARY LIBDL_INCLUDE_DIR)
+ 	mark_as_advanced(LIBBFD_INCLUDE_DIR LIBBFD_LIBRARY
+ 		LIBDL_INCLUDE_DIR LIBDL_LIBRARY)
+@@ -84,8 +124,8 @@ if (${STACK_DETAILS_AUTO_DETECT})
+ 	find_library(LIBDL_LIBRARY dl)
+ 	set(LIBDWARF_INCLUDE_DIRS ${LIBDWARF_INCLUDE_DIR} ${LIBELF_INCLUDE_DIR} ${LIBDL_INCLUDE_DIR})
+ 	set(LIBDWARF_LIBRARIES ${LIBDWARF_LIBRARY} ${LIBELF_LIBRARY} ${LIBDL_LIBRARY})
+-	find_package_handle_standard_args(libdwarf DEFAULT_MSG
+-		LIBDWARF_LIBRARY LIBDWARF_INCLUDE_DIR
++	find_package_handle_standard_args(libdwarf ${_name_mismatched_arg}
++		REQUIRED_VARS LIBDWARF_LIBRARY LIBDWARF_INCLUDE_DIR
+ 		LIBELF_LIBRARY LIBELF_INCLUDE_DIR
+ 		LIBDL_LIBRARY LIBDL_INCLUDE_DIR)
+ 	mark_as_advanced(LIBDWARF_INCLUDE_DIR LIBDWARF_LIBRARY
+@@ -106,6 +146,11 @@ if (${STACK_DETAILS_AUTO_DETECT})
+ 		# If we attempt to link against static bfd, make sure to link its dependencies, too
+ 		get_filename_component(bfd_lib_ext "${LIBBFD_LIBRARY}" EXT)
+ 		if (bfd_lib_ext STREQUAL "${CMAKE_STATIC_LIBRARY_SUFFIX}")
++			find_library(LIBSFRAME_LIBRARY NAMES sframe)
++			if (LIBSFRAME_LIBRARY)
++				list(APPEND _BACKWARD_LIBRARIES ${LIBSFRAME_LIBRARY})
++			endif()
++
+ 			list(APPEND _BACKWARD_LIBRARIES iberty z)
+ 		endif()
+ 
+@@ -152,11 +197,29 @@ macro(map_definitions var_prefix define_prefix)
+ endmacro()
+ 
+ if (NOT _BACKWARD_DEFINITIONS)
+-	map_definitions("STACK_WALKING_" "BACKWARD_HAS_" UNWIND BACKTRACE)
++	map_definitions("STACK_WALKING_" "BACKWARD_HAS_" UNWIND LIBUNWIND BACKTRACE)
+ 	map_definitions("STACK_DETAILS_" "BACKWARD_HAS_" BACKTRACE_SYMBOL DW BFD DWARF)
+ endif()
+ 
+-set(BACKWARD_INCLUDE_DIR "${CMAKE_CURRENT_LIST_DIR}")
++if(WIN32)
++	list(APPEND _BACKWARD_LIBRARIES dbghelp psapi)
++	if(MINGW)
++		include(CheckCXXCompilerFlag)
++		check_cxx_compiler_flag(-gcodeview SUPPORT_WINDOWS_DEBUG_INFO)	
++		if(SUPPORT_WINDOWS_DEBUG_INFO)
++			set(CMAKE_EXE_LINKER_FLAGS "-Wl,--pdb= ")
++			add_compile_options(-gcodeview)
++		else()
++			set(MINGW_MSVCR_LIBRARY "msvcr90$<$<CONFIG:DEBUG>:d>" CACHE STRING "Mingw MSVC runtime import library")
++			list(APPEND _BACKWARD_LIBRARIES ${MINGW_MSVCR_LIBRARY})
++		endif()
++	endif()	
++endif()
++
++set(BACKWARD_INCLUDE_DIR
++	$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}>
++	$<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
++)
+ 
+ set(BACKWARD_HAS_EXTERNAL_LIBRARIES FALSE)
+ set(FIND_PACKAGE_REQUIRED_VARS BACKWARD_INCLUDE_DIR)
+@@ -167,17 +230,25 @@ endif()
+ 
+ include(FindPackageHandleStandardArgs)
+ find_package_handle_standard_args(Backward
+-    REQUIRED_VARS ${FIND_PACKAGE_REQUIRED_VARS}
++	REQUIRED_VARS ${FIND_PACKAGE_REQUIRED_VARS}
+ )
+ list(APPEND _BACKWARD_INCLUDE_DIRS ${BACKWARD_INCLUDE_DIR})
+ 
++# add_backward, optional bool argument; if passed and true, backward will be included as a system header
+ macro(add_backward target)
+-	target_include_directories(${target} PRIVATE ${BACKWARD_INCLUDE_DIRS})
++	message(DEPRECATION "The add_backward() macro is deprecated, use target_link_libraries() to link to "
++	        "one of the exported targets: Backward::Interface, Backward::Object, or Backward::Backward."
++	)
++	if ("${ARGN}")
++		target_include_directories(${target} SYSTEM PRIVATE ${BACKWARD_INCLUDE_DIRS})
++	else()
++		target_include_directories(${target} PRIVATE ${BACKWARD_INCLUDE_DIRS})
++	endif()
+ 	set_property(TARGET ${target} APPEND PROPERTY COMPILE_DEFINITIONS ${BACKWARD_DEFINITIONS})
+ 	set_property(TARGET ${target} APPEND PROPERTY LINK_LIBRARIES ${BACKWARD_LIBRARIES})
+ endmacro()
+ 
+-set(BACKWARD_INCLUDE_DIRS ${_BACKWARD_INCLUDE_DIRS} CACHE INTERNAL "_BACKWARD_INCLUDE_DIRS")
++set(BACKWARD_INCLUDE_DIRS ${_BACKWARD_INCLUDE_DIRS} CACHE INTERNAL "BACKWARD_INCLUDE_DIRS")
+ set(BACKWARD_DEFINITIONS ${_BACKWARD_DEFINITIONS} CACHE INTERNAL "BACKWARD_DEFINITIONS")
+ set(BACKWARD_LIBRARIES ${_BACKWARD_LIBRARIES} CACHE INTERNAL "BACKWARD_LIBRARIES")
+ mark_as_advanced(BACKWARD_INCLUDE_DIRS BACKWARD_DEFINITIONS BACKWARD_LIBRARIES)
+@@ -185,22 +256,15 @@ mark_as_advanced(BACKWARD_INCLUDE_DIRS BACKWARD_DEFINITIONS BACKWARD_LIBRARIES)
+ # Expand each definition in BACKWARD_DEFINITIONS to its own cmake var and export
+ # to outer scope
+ foreach(var ${BACKWARD_DEFINITIONS})
+-  string(REPLACE "=" ";" var_as_list ${var})
+-  list(GET var_as_list 0 var_name)
+-  list(GET var_as_list 1 var_value)
+-  set(${var_name} ${var_value})
+-  mark_as_advanced(${var_name})
++	string(REPLACE "=" ";" var_as_list ${var})
++	list(GET var_as_list 0 var_name)
++	list(GET var_as_list 1 var_value)
++	set(${var_name} ${var_value})
++	mark_as_advanced(${var_name})
+ endforeach()
+ 
+-if (NOT TARGET Backward::Backward)
+-	add_library(Backward::Backward INTERFACE IMPORTED)
+-	set_target_properties(Backward::Backward PROPERTIES
+-	    INTERFACE_INCLUDE_DIRECTORIES "${BACKWARD_INCLUDE_DIRS}"
+-	    INTERFACE_COMPILE_DEFINITIONS "${BACKWARD_DEFINITIONS}"
+-	)
+-	if(BACKWARD_HAS_EXTERNAL_LIBRARIES)
+-		set_target_properties(Backward::Backward PROPERTIES
+-			INTERFACE_LINK_LIBRARIES "${BACKWARD_LIBRARIES}" 
+-		)
+-	endif()
++# if this file is used from the install tree by find_package(), include the
++# file CMake-generated file where the targets are defined
++if(EXISTS ${CMAKE_CURRENT_LIST_DIR}/BackwardTargets.cmake)
++	include(${CMAKE_CURRENT_LIST_DIR}/BackwardTargets.cmake)
+ endif()
+diff --git a/3rdparty/backward-cpp/CMakeLists.txt b/3rdparty/backward-cpp/CMakeLists.txt
+index 3f6e54ed..e625f8ac 100644
+--- a/3rdparty/backward-cpp/CMakeLists.txt
++++ b/3rdparty/backward-cpp/CMakeLists.txt
+@@ -20,7 +20,7 @@
+ # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ # SOFTWARE.
+ 
+-cmake_minimum_required(VERSION 3.0)
++cmake_minimum_required(VERSION 3.14)
+ project(backward CXX)
+ 
+ # Introduce variables:
+@@ -31,6 +31,22 @@ include(GNUInstallDirs)
+ 
+ include(BackwardConfig.cmake)
+ 
++###############################################################################
++# OPTIONS
++###############################################################################
++
++option(BACKWARD_SHARED "Build backward as a shared library" OFF)
++if(CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR AND NOT DEFINED BACKWARD_TESTS)
++	# If this is a top level CMake project, we most lixely want the tests
++	set(BACKWARD_TESTS ON CACHE BOOL "Enable tests")
++else()
++	set(BACKWARD_TESTS OFF CACHE BOOL "Enable tests")
++endif()
++
++###############################################################################
++# COMPILER FLAGS
++###############################################################################
++
+ # check if compiler is nvcc or nvcc_wrapper
+ set(COMPILER_IS_NVCC false)
+ get_filename_component(COMPILER_NAME ${CMAKE_CXX_COMPILER} NAME)
+@@ -52,10 +68,6 @@ if (${COMPILER_IS_NVCC})
+   set(CMAKE_CXX_EXTENSIONS OFF)
+ endif()
+ 
+-###############################################################################
+-# COMPILER FLAGS
+-###############################################################################
+-
+ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_COMPILER_IS_GNUCXX)
+ 	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wall -Wextra")
+ 	if (NOT ${COMPILER_IS_NVCC})
+@@ -65,21 +77,100 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang" OR CMAKE_COMPILER_IS_GNUCXX)
+ endif()
+ 
+ ###############################################################################
+-# BACKWARD OBJECT
++# BACKWARD INTERFACE
+ ###############################################################################
+ 
+-add_library(backward_object OBJECT backward.cpp)
+-target_compile_definitions(backward_object PRIVATE ${BACKWARD_DEFINITIONS})
+-target_include_directories(backward_object PRIVATE ${BACKWARD_INCLUDE_DIRS})
+-set(BACKWARD_ENABLE $<TARGET_OBJECTS:backward_object> CACHE STRING
+-	"Link with this object to setup backward automatically")
++add_library(backward_interface INTERFACE)
++set_target_properties(backward_interface PROPERTIES EXPORT_NAME Interface)
++target_compile_definitions(backward_interface INTERFACE ${BACKWARD_DEFINITIONS})
++target_include_directories(backward_interface INTERFACE ${BACKWARD_INCLUDE_DIRS})
++if(BACKWARD_HAS_EXTERNAL_LIBRARIES)
++    target_link_libraries(backward_interface INTERFACE ${BACKWARD_LIBRARIES})
++endif()
++add_library(Backward::Interface ALIAS backward_interface)
+ 
++###############################################################################
++# BACKWARD OBJECT (Includes backward.cpp)
++# (Note that this target is not exported, since CMake currently does not allow
++# exporting an OBJECT library.)
++###############################################################################
++
++add_library(backward_object OBJECT backward.cpp)
++set_target_properties(backward_object PROPERTIES EXPORT_NAME Object)
++target_link_libraries(backward_object PUBLIC Backward::Interface)
++add_library(Backward::Object ALIAS backward_object)
+ 
+ ###############################################################################
+ # BACKWARD LIBRARY (Includes backward.cpp)
++# (Note that the linker will not include unused objects from a static library,
++# unless the -Wl,--whole-archive option (or similar) is used.)
++###############################################################################
++
++set(libtype STATIC)
++if(BACKWARD_SHARED)
++    set(libtype SHARED)
++endif()
++add_library(backward ${libtype} backward.cpp)
++set_target_properties(backward PROPERTIES EXPORT_NAME Backward)
++target_link_libraries(backward PUBLIC Backward::Interface)
++add_library(Backward::Backward ALIAS backward)
++
+ ###############################################################################
++# TESTS
++###############################################################################
++
++if(BACKWARD_TESTS)
++	enable_testing()
++
++	add_library(test_main OBJECT test/_test_main.cpp)
++
++	macro(backward_add_test src)
++		get_filename_component(name ${src} NAME_WE)
++		set(test_name "test_${name}")
+ 
+-add_library(backward STATIC backward.cpp)
+-target_compile_definitions(backward PUBLIC ${BACKWARD_DEFINITIONS})
+-target_include_directories(backward PUBLIC ${BACKWARD_INCLUDE_DIRS})
++		add_executable(${test_name} ${src} ${ARGN} $<TARGET_OBJECTS:test_main>)
+ 
++		target_link_libraries(${test_name} PRIVATE Backward::Interface)
++
++		add_test(NAME ${name} COMMAND ${test_name})
++	endmacro()
++
++	# Tests without backward.cpp
++	set(TESTS
++		test
++		stacktrace
++		rectrace
++		select_signals
++		)
++
++	foreach(test ${TESTS})
++		backward_add_test(test/${test}.cpp)
++	endforeach()
++
++	# Tests with backward.cpp
++	set(TESTS
++		suicide
++		)
++
++	foreach(test ${TESTS})
++		backward_add_test(test/${test}.cpp backward.cpp)
++	endforeach()
++endif()
++
++install(
++    FILES "backward.hpp"
++    DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
++)
++install(
++    FILES "BackwardConfig.cmake"
++    DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}"
++)
++# check if Backward is being used as a top-level project or included as a subproject
++if(CMAKE_SOURCE_DIR STREQUAL PROJECT_SOURCE_DIR)
++    # export the targets (note that exporting backward_object does not make sense)
++    install(TARGETS backward_interface backward EXPORT BackwardTargets)
++    # install a CMake file for the exported targets
++    install(EXPORT BackwardTargets
++            NAMESPACE Backward::
++            DESTINATION "${CMAKE_INSTALL_LIBDIR}/cmake/${PROJECT_NAME}")
++endif()
+diff --git a/3rdparty/backward-cpp/README.md b/3rdparty/backward-cpp/README.md
+index 139d5aa8..92c98e92 100644
+--- a/3rdparty/backward-cpp/README.md
++++ b/3rdparty/backward-cpp/README.md
+@@ -1,4 +1,4 @@
+-Backward-cpp [![badge](https://img.shields.io/badge/conan.io-backward%2F1.3.0-green.svg?logo=data:image/png;base64%2CiVBORw0KGgoAAAANSUhEUgAAAA4AAAAOCAMAAAAolt3jAAAA1VBMVEUAAABhlctjlstkl8tlmMtlmMxlmcxmmcxnmsxpnMxpnM1qnc1sn85voM91oM11oc1xotB2oc56pNF6pNJ2ptJ8ptJ8ptN9ptN8p9N5qNJ9p9N9p9R8qtOBqdSAqtOAqtR%2BrNSCrNJ/rdWDrNWCsNWCsNaJs9eLs9iRvNuVvdyVv9yXwd2Zwt6axN6dxt%2Bfx%2BChyeGiyuGjyuCjyuGly%2BGlzOKmzOGozuKoz%2BKqz%2BOq0OOv1OWw1OWw1eWx1eWy1uay1%2Baz1%2Baz1%2Bez2Oe02Oe12ee22ujUGwH3AAAAAXRSTlMAQObYZgAAAAFiS0dEAIgFHUgAAAAJcEhZcwAACxMAAAsTAQCanBgAAAAHdElNRQfgBQkREyOxFIh/AAAAiklEQVQI12NgAAMbOwY4sLZ2NtQ1coVKWNvoc/Eq8XDr2wB5Ig62ekza9vaOqpK2TpoMzOxaFtwqZua2Bm4makIM7OzMAjoaCqYuxooSUqJALjs7o4yVpbowvzSUy87KqSwmxQfnsrPISyFzWeWAXCkpMaBVIC4bmCsOdgiUKwh3JojLgAQ4ZCE0AMm2D29tZwe6AAAAAElFTkSuQmCC)](http://www.conan.io/source/backward/1.3.0/Manu343726/testing) [![Build Status](https://travis-ci.org/bombela/backward-cpp.svg?branch=master)](https://travis-ci.org/cwbombela/backward-cpp)
++Backward-cpp [![Conan Center](https://img.shields.io/conan/v/backward-cpp)](https://conan.io/center/recipes/backward-cpp)
+ ============
+ 
+ Backward is a beautiful stack trace pretty printer for C++.
+@@ -37,33 +37,67 @@ errors (segfault, abort, un-handled exception...), simply add a copy of
+ `backward.cpp` to your project, and don't forget to tell your build system.
+ 
+ The code in `backward.cpp` is trivial anyway, you can simply copy what it's
+-doing at your convenience.
++doing at your convenience. 
++
++Note for [folly](https://github.com/facebook/folly) library users: must define `backward::SignalHandling sh;` after `folly::init(&argc, &argv);`.
+ 
+ ## Configuration & Dependencies
+ 
+ ### Integration with CMake
+ 
+-If you are using CMake and want to use its configuration abilities to save
+-you the trouble, you can easily integrate Backward, depending on how you obtained
++If you are using CMake and want to use its configuration abilities to save you
++the trouble, you can easily integrate Backward, depending on how you obtained
+ the library.
+ 
++Notice that all approaches are equivalent in the way Backward is added to a
++CMake target, the difference is in how CMake is pointed to the Backward
++sources. Backward defines three targets:
++
++- `Backward::Interface` is an interface target that brings compiler definition
++  flags, include directory, and external libraries. This is all you need to use
++  the `backward.hpp` header library.
++- `Backward::Object` brings `Backward::Interface` and `backward.cpp` as an
++  `OBJECT` CMake library. This target cannot be exported, so it is not
++  available when Backward is used via `find_package`.
++- `Backward::Backward` brings `Backward::Interface` and `backward.cpp` as
++  either `STATIC` or `SHARED` library (depending on the `BACKWARD_SHARED`
++  option). This target is exported and always available, however note that the
++  linker will not include unused objects from a static library, unless the
++  `-Wl,--whole-archive` option (or similar) is used.
++
++#### With `FetchContent()`:
++
++If you are using a recent version of CMake, you can integrate `backward` via `FetchContent` like below:
++
++```cmake
++include(FetchContent)
++
++# Also requires one of: libbfd (gnu binutils), libdwarf, libdw (elfutils)
++FetchContent_Declare(backward
++    GIT_REPOSITORY https://github.com/bombela/backward-cpp
++    GIT_TAG master  # or a version tag, such as v1.6
++    SYSTEM          # optional, the Backward include directory will be treated as system directory
++)
++FetchContent_MakeAvailable(backward)
++
++# Add Backward to your target (either Backward::Interface, Backward::Object, or Backward::Backward)
++target_link_libraries(mytarget PUBLIC Backward::Interface)
++```
++
+ #### As a subdirectory:
+ 
+ In this case you have a subdirectory containing the whole repository of Backward
+-(eg.: using git-submodules), in this case you can do:
++(e.g. using [git-submodule](https://git-scm.com/book/en/v2/Git-Tools-Submodules)),
++in this case you can do:
+ 
+-```
++```cmake
+ add_subdirectory(/path/to/backward-cpp)
+ 
+-# This will add backward.cpp to your target
+-add_executable(mytarget mysource.cpp ${BACKWARD_ENABLE})
+-
+-# This will add libraries, definitions and include directories needed by backward
+-# by setting each property on the target.
+-add_backward(mytarget)
++# Add Backward to your target (either Backward::Interface, Backward::Object, or Backward::Backward)
++target_link_libraries(mytarget PUBLIC Backward::Interface)
+ ```
+ 
+-#### Modifying CMAKE_MODULE_PATH
++#### Modifying `CMAKE_MODULE_PATH`:
+ 
+ In this case you can have Backward installed as a subdirectory:
+ 
+@@ -71,14 +105,10 @@ In this case you can have Backward installed as a subdirectory:
+ list(APPEND CMAKE_MODULE_PATH /path/to/backward-cpp)
+ find_package(Backward)
+ 
+-# This will add libraries, definitions and include directories needed by backward
+-# through an IMPORTED target.
+-target_link_libraries(mytarget PUBLIC Backward::Backward)
++# Add Backward to your target (either Backward::Interface or Backward::Backward)
++target_link_libraries(mytarget PUBLIC Backward::Interface)
+ ```
+ 
+-Notice that this is equivalent to using the the approach that uses `add_subdirectory()`,
+-however it uses cmake's [imported target](https://cmake.org/Wiki/CMake/Tutorials/Exporting_and_Importing_Targets) mechanism.
+-
+ #### Installation through a regular package manager
+ 
+ In this case you have obtained Backward through a package manager.
+@@ -89,11 +119,40 @@ Packages currently available:
+ ```
+ find_package(Backward)
+ 
+-# This will add libraries, definitions and include directories needed by backward
+-# through an IMPORTED target.
+-target_link_libraries(mytarget PUBLIC Backward::Backward)
++# Add Backward to your target (either Backward::Interface or Backward::Backward)
++target_link_libraries(mytarget PUBLIC Backward::Interface)
+ ```
+ 
++### Libraries to unwind the stack
++
++On Linux and macOS, backtrace can back-trace or "walk" the stack using the
++following libraries:
++
++#### unwind
++
++Unwind comes from libgcc, but there is an equivalent inside clang itself. With
++unwind, the stacktrace is as accurate as it can possibly be, since this is
++used by the C++ runtine in gcc/clang for stack unwinding on exception.
++
++Normally libgcc is already linked to your program by default.
++
++#### libunwind from the [libunwind project](https://github.com/libunwind/libunwind)
++
++	apt-get install binutils-dev (or equivalent)
++
++Libunwind provides, in some cases, a more accurate stacktrace as it knows
++to decode signal handler frames and lets us edit the context registers when
++unwinding, allowing stack traces over bad function references.
++
++For best results make sure you are using libunwind 1.3 or later, which added
++`unw_init_local2` and support for handling signal frames.
++
++CMake will warn you when configuring if your libunwind version doesn't support
++signal frames.
++
++On macOS clang provides a libunwind API compatible library as part of its
++environment, so no third party libraries are necessary.
++
+ ### Compile with debug info
+ 
+ You need to compile your project with generation of debug symbols enabled,
+@@ -110,24 +169,27 @@ your sources.
+ 
+ ### Libraries to read the debug info
+ 
+-Backward support pretty printed stack traces on GNU/Linux only, it will compile
+-fine under other platforms but will not do anything.  **Pull requests are
+-welcome :)**
++Backward supports pretty printed stack traces on GNU/Linux, macOS and Windows,
++it will compile fine under other platforms but will not do anything. **Pull
++requests are welcome :)**
+ 
+ Also, by default you will get a really basic stack trace, based on the
+ `backtrace_symbols` API:
+ 
+ ![default trace](doc/nice.png)
+ 
+-You will need to install some dependencies to get the ultimate stack trace. Two
+-libraries are currently supported, the only difference is which one is the
++You will need to install some dependencies to get the ultimate stack trace.
++Three libraries are currently supported, the only difference is which one is the
+ easiest for you to install, so pick your poison:
+ 
+ #### libbfd from the [GNU/binutils](http://www.gnu.org/software/binutils/)
+ 
+ 	apt-get install binutils-dev (or equivalent)
+ 
+-And do not forget to link with the lib: `g++/clang++ -lbfd ...`
++And do not forget to link with the lib: `g++/clang++ -lbfd -ldl ...`
++
++This library requires dynamic loading. Which is provided by the library `dl`.
++Hence why we also link with `-ldl`.
+ 
+ Then define the following before every inclusion of `backward.hpp` (don't
+ forget to update `backward.cpp` as well):
+@@ -146,7 +208,29 @@ Of course you can simply add the define (`-DBACKWARD_HAS_...=1`) and the
+ linkage details in your build system and even auto-detect which library is
+ installed, it's up to you.
+ 
+-That'ss it, you are all set, you should be getting nice stack traces like the
++#### [libdwarf](https://sourceforge.net/projects/libdwarf/) and [libelf](http://www.mr511.de/software/english.html)
++
++	apt-get install libdwarf-dev (or equivalent)
++
++And do not forget to link with the lib and inform Backward to use it:
++
++	#define BACKWARD_HAS_DWARF 1
++
++There are several alternative implementations of libdwarf and libelf that
++are API compatible so it's possible, although it hasn't been tested, to
++replace the ones used when developing backward (in bold, below):
++
++* **_libelf_** by [Michael "Tired" Riepe](http://www.mr511.de/software/english.html)
++* **_libdwarf_** by [David Anderson](https://www.prevanders.net/dwarf.html)
++* libelf from [elfutils](https://fedorahosted.org/elfutils/)
++* libelf and libdwarf from FreeBSD's [ELF Tool Chain](https://sourceforge.net/p/elftoolchain/wiki/Home/) project
++
++
++Of course you can simply add the define (`-DBACKWARD_HAS_...=1`) and the
++linkage details in your build system and even auto-detect which library is
++installed, it's up to you.
++
++That's it, you are all set, you should be getting nice stack traces like the
+ one at the beginning of this document.
+ 
+ ## API
+@@ -267,7 +351,7 @@ using namespace backward;
+ StackTrace st; st.load_here(32);
+ Printer p;
+ p.object = true;
+-p.color = false;
++p.color_mode = ColorMode::always;
+ p.address = true;
+ p.print(st, stderr);
+ ```
+@@ -279,21 +363,29 @@ class Printer { public:
+ 	// Print a little snippet of code if possible.
+ 	bool snippet = true;
+ 
+-	// Colorize the trace (only set a color when printing on a terminal)
+-	bool color = true;
++	// Colorize the trace
++	//  - ColorMode::automatic: Activate colors if possible. For example, when using a TTY on linux.
++	//  - ColorMode::always: Always use colors.
++	//  - ColorMode::never: Never use colors.
++	bool color_mode = ColorMode::automatic;
+ 
+ 	// Add the addresses of every source location to the trace.
+ 	bool address = false;
+ 
+-	// Even if there is a source location, prints the object the trace comes
+-	// from as well.
++	// Even if there is a source location, also prints the object
++	// from where the trace came from.
+ 	bool object = false;
+ 
+-	// Resolve and print a stack trace. It takes a C FILE* object, only because
+-	// it is possible to access the underalying OS-level file descriptor, which
+-	// is then used to determine if the output is a terminal to print in color.
++	// Resolve and print a stack trace to the given C FILE* object.
++	// On linux, if the FILE* object is attached to a TTY,
++	// color will be used if color_mode is set to automatic.
+ 	template <typename StackTrace>
+-		FILE* print(StackTrace& st, FILE* os = stderr)
++		FILE* print(StackTrace& st, FILE* fp = stderr);
++
++	// Resolve and print a stack trace to the given std::ostream object.
++	// Color will only be used if color_mode is set to always. 
++	template <typename ST>
++		std::ostream& print(ST& st, std::ostream& os);
+ ```
+ 
+ 
+@@ -315,6 +407,12 @@ this object doesn't do anything. It exposes only one method:
+ bool loaded() const // true if loaded with success
+ ```
+ 
++**Warning:** The registered signal handlers are not
++[signal safe](https://www.man7.org/linux/man-pages/man7/signal-safety.7.html),
++mostly because backward-cpp and the DWARF decoding libraries are using `malloc`.
++In case a signal is raised while malloc is holding a lock, a deadlock will
++occur.
++
+ ### Trace object
+ 
+ To keep the memory footprint of a loaded `StackTrace` on the low-side, there a
+@@ -340,8 +438,8 @@ struct ResolvedTrace: public Trace {
+ 	struct SourceLoc {
+ 		std::string function;
+ 		std::string filename;
+-		size_t      line;
+-		size_t      col;
++		unsigned    line;
++		unsigned    col;
+ 	};
+ 
+ 	// In which binary object this trace is located.
+@@ -369,7 +467,7 @@ struct ResolvedTrace: public Trace {
+ 
+ François-Xavier Bourlet <bombela@gmail.com>
+ 
+-Copyright 2013 Google Inc. All Rights Reserved.
++Copyright 2013-2017 Google Inc. All Rights Reserved.
+ MIT License.
+ 
+ ### Disclaimer
+diff --git a/3rdparty/backward-cpp/backward.cpp b/3rdparty/backward-cpp/backward.cpp
+index 4c68284d..110441cb 100644
+--- a/3rdparty/backward-cpp/backward.cpp
++++ b/3rdparty/backward-cpp/backward.cpp
+@@ -11,7 +11,7 @@
+ //	- line and column numbers
+ //	- source code snippet (assuming the file is accessible)
+ 
+-// Install one of the following library then uncomment one of the macro (or
++// Install one of the following libraries then uncomment one of the macro (or
+ // better, add the detection of the lib and the macro definition in your build
+ // system)
+ 
+@@ -23,6 +23,16 @@
+ // - g++/clang++ -lbfd ...
+ // #define BACKWARD_HAS_BFD 1
+ 
++// - apt-get install libdwarf-dev ...
++// - g++/clang++ -ldwarf ...
++// #define BACKWARD_HAS_DWARF 1
++
++// Regardless of the library you choose to read the debug information,
++// for potentially more detailed stack traces you can use libunwind
++// - apt-get install libunwind-dev
++// - g++/clang++ -lunwind
++// #define BACKWARD_HAS_LIBUNWIND 1
++
+ #include "backward.hpp"
+ 
+ namespace backward {
+diff --git a/3rdparty/backward-cpp/backward.hpp b/3rdparty/backward-cpp/backward.hpp
+index 8926cc53..670aa458 100644
+--- a/3rdparty/backward-cpp/backward.hpp
++++ b/3rdparty/backward-cpp/backward.hpp
+@@ -35,6 +35,9 @@
+ #define BACKWARD_CXX11
+ #define BACKWARD_ATLEAST_CXX11
+ #define BACKWARD_ATLEAST_CXX98
++#if __cplusplus >= 201703L || (defined(_MSVC_LANG) && _MSVC_LANG >= 201703L)
++#define BACKWARD_ATLEAST_CXX17
++#endif
+ #else
+ #define BACKWARD_CXX98
+ #define BACKWARD_ATLEAST_CXX98
+@@ -49,6 +52,9 @@
+ // #define BACKWARD_SYSTEM_DARWIN
+ //	- specialization for Mac OS X 10.5 and later.
+ //
++// #define BACKWARD_SYSTEM_WINDOWS
++//  - specialization for Windows (Clang 9 and MSVC2017)
++//
+ // #define BACKWARD_SYSTEM_UNKNOWN
+ //	- placebo implementation, does nothing.
+ //
+@@ -84,6 +90,8 @@
+ #include <streambuf>
+ #include <string>
+ #include <vector>
++#include <exception>
++#include <iterator>
+ 
+ #if defined(BACKWARD_SYSTEM_LINUX)
+ 
+@@ -93,10 +101,15 @@
+ // #define BACKWARD_HAS_UNWIND 1
+ //  - unwind comes from libgcc, but I saw an equivalent inside clang itself.
+ //  - with unwind, the stacktrace is as accurate as it can possibly be, since
+-//  this is used by the C++ runtine in gcc/clang for stack unwinding on
++//  this is used by the C++ runtime in gcc/clang for stack unwinding on
+ //  exception.
+ //  - normally libgcc is already linked to your program by default.
+ //
++// #define BACKWARD_HAS_LIBUNWIND 1
++//  - libunwind provides, in some cases, a more accurate stacktrace as it knows
++//  to decode signal handler frames and lets us edit the context registers when
++//  unwinding, allowing stack traces over bad function references.
++//
+ // #define BACKWARD_HAS_BACKTRACE == 1
+ //  - backtrace seems to be a little bit more portable than libunwind, but on
+ //  linux, it uses unwind anyway, but abstract away a tiny information that is
+@@ -109,10 +122,13 @@
+ // Note that only one of the define should be set to 1 at a time.
+ //
+ #if BACKWARD_HAS_UNWIND == 1
++#elif BACKWARD_HAS_LIBUNWIND == 1
+ #elif BACKWARD_HAS_BACKTRACE == 1
+ #else
+ #undef BACKWARD_HAS_UNWIND
+ #define BACKWARD_HAS_UNWIND 1
++#undef BACKWARD_HAS_LIBUNWIND
++#define BACKWARD_HAS_LIBUNWIND 0
+ #undef BACKWARD_HAS_BACKTRACE
+ #define BACKWARD_HAS_BACKTRACE 0
+ #endif
+@@ -125,9 +141,10 @@
+ //    - object filename
+ //    - function name
+ //    - source filename
+-//	  - line and column numbers
+-//	  - source code snippet (assuming the file is accessible)
+-//	  - variables name and values (if not optimized out)
++//    - line and column numbers
++//    - source code snippet (assuming the file is accessible)
++//    - variable names (if not optimized out)
++//    - variable values (not supported by backward-cpp)
+ //  - You need to link with the lib "dw":
+ //    - apt-get install libdw-dev
+ //    - g++/clang++ -ldw ...
+@@ -137,8 +154,8 @@
+ //    - object filename
+ //    - function name
+ //    - source filename
+-//	  - line numbers
+-//	  - source code snippet (assuming the file is accessible)
++//    - line numbers
++//    - source code snippet (assuming the file is accessible)
+ //  - You need to link with the lib "bfd":
+ //    - apt-get install binutils-dev
+ //    - g++/clang++ -lbfd ...
+@@ -150,7 +167,8 @@
+ //    - source filename
+ //    - line and column numbers
+ //    - source code snippet (assuming the file is accessible)
+-//    - variables name and values (if not optimized out)
++//    - variable names (if not optimized out)
++//    - variable values (not supported by backward-cpp)
+ //  - You need to link with the lib "dwarf":
+ //    - apt-get install libdwarf-dev
+ //    - g++/clang++ -ldwarf ...
+@@ -193,10 +211,23 @@
+ #else
+ #include <link.h>
+ #endif
++#if defined(__ppc__) || defined(__powerpc) || defined(__powerpc__) ||        \
++    defined(__POWERPC__)
++// Linux kernel header required for the struct pt_regs definition
++// to access the NIP (Next Instruction Pointer) register value
++#include <asm/ptrace.h>
++#endif
+ #include <signal.h>
+ #include <sys/stat.h>
+ #include <syscall.h>
+ #include <unistd.h>
++#ifndef _GNU_SOURCE
++#define _GNU_SOURCE
++#include <dlfcn.h>
++#undef _GNU_SOURCE
++#else
++#include <dlfcn.h>
++#endif
+ 
+ #if BACKWARD_HAS_BFD == 1
+ //              NOTE: defining PACKAGE{,_VERSION} is required before including
+@@ -209,13 +240,6 @@
+ #define PACKAGE_VERSION
+ #endif
+ #include <bfd.h>
+-#ifndef _GNU_SOURCE
+-#define _GNU_SOURCE
+-#include <dlfcn.h>
+-#undef _GNU_SOURCE
+-#else
+-#include <dlfcn.h>
+-#endif
+ #endif
+ 
+ #if BACKWARD_HAS_DW == 1
+@@ -230,13 +254,6 @@
+ #include <libdwarf.h>
+ #include <libelf.h>
+ #include <map>
+-#ifndef _GNU_SOURCE
+-#define _GNU_SOURCE
+-#include <dlfcn.h>
+-#undef _GNU_SOURCE
+-#else
+-#include <dlfcn.h>
+-#endif
+ #endif
+ 
+ #if (BACKWARD_HAS_BACKTRACE == 1) || (BACKWARD_HAS_BACKTRACE_SYMBOL == 1)
+@@ -253,10 +270,16 @@
+ // #define BACKWARD_HAS_UNWIND 1
+ //  - unwind comes from libgcc, but I saw an equivalent inside clang itself.
+ //  - with unwind, the stacktrace is as accurate as it can possibly be, since
+-//  this is used by the C++ runtine in gcc/clang for stack unwinding on
++//  this is used by the C++ runtime in gcc/clang for stack unwinding on
+ //  exception.
+ //  - normally libgcc is already linked to your program by default.
+ //
++// #define BACKWARD_HAS_LIBUNWIND 1
++//  - libunwind comes from clang, which implements an API compatible version.
++//  - libunwind provides, in some cases, a more accurate stacktrace as it knows
++//  to decode signal handler frames and lets us edit the context registers when
++//  unwinding, allowing stack traces over bad function references.
++//
+ // #define BACKWARD_HAS_BACKTRACE == 1
+ //  - backtrace is available by default, though it does not produce as much
+ //  information as another library might.
+@@ -268,11 +291,14 @@
+ //
+ #if BACKWARD_HAS_UNWIND == 1
+ #elif BACKWARD_HAS_BACKTRACE == 1
++#elif BACKWARD_HAS_LIBUNWIND == 1
+ #else
+ #undef BACKWARD_HAS_UNWIND
+ #define BACKWARD_HAS_UNWIND 1
+ #undef BACKWARD_HAS_BACKTRACE
+ #define BACKWARD_HAS_BACKTRACE 0
++#undef BACKWARD_HAS_LIBUNWIND
++#define BACKWARD_HAS_LIBUNWIND 0
+ #endif
+ 
+ // On Darwin, backward can extract detailed information about a stack trace
+@@ -310,14 +336,21 @@
+ #include <mutex>
+ #include <thread>
+ 
+-#include <BaseTsd.h>
++#include <basetsd.h>
++
++#ifdef _WIN64
+ typedef SSIZE_T ssize_t;
++#else
++typedef int ssize_t;
++#endif
+ 
++#ifndef NOMINMAX
+ #define NOMINMAX
+-#include <Windows.h>
++#endif
++#include <windows.h>
+ #include <winnt.h>
+ 
+-#include <Psapi.h>
++#include <psapi.h>
+ #include <signal.h>
+ 
+ #ifndef __clang__
+@@ -325,8 +358,10 @@ typedef SSIZE_T ssize_t;
+ #define NOINLINE __declspec(noinline)
+ #endif
+ 
++#ifdef _MSC_VER
+ #pragma comment(lib, "psapi.lib")
+ #pragma comment(lib, "dbghelp.lib")
++#endif
+ 
+ // Comment / packing is from stackoverflow:
+ // https://stackoverflow.com/questions/6205981/windows-c-stack-trace-from-a-running-app/28276227#28276227
+@@ -371,6 +406,11 @@ extern "C" uintptr_t _Unwind_GetIPInfo(_Unwind_Context *, int *);
+ 
+ #endif // BACKWARD_HAS_UNWIND == 1
+ 
++#if BACKWARD_HAS_LIBUNWIND == 1
++#define UNW_LOCAL_ONLY
++#include <libunwind.h>
++#endif // BACKWARD_HAS_LIBUNWIND == 1
++
+ #ifdef BACKWARD_ATLEAST_CXX11
+ #include <unordered_map>
+ #include <utility> // for std::swap
+@@ -530,7 +570,7 @@ public:
+ 
+   void update(T new_val) {
+     _val = new_val;
+-    _empty = static_cast<bool>(new_val);
++    _empty = !static_cast<bool>(new_val);
+   }
+ 
+   operator const dummy *() const {
+@@ -609,9 +649,9 @@ inline std::vector<std::string> split_source_prefixes(const std::string &s) {
+   std::vector<std::string> out;
+   size_t last = 0;
+   size_t next = 0;
+-  size_t delimiter_size = sizeof(kBackwardPathDelimiter)-1;
++  size_t delimiter_size = sizeof(kBackwardPathDelimiter) - 1;
+   while ((next = s.find(kBackwardPathDelimiter, last)) != std::string::npos) {
+-    out.push_back(s.substr(last, next-last));
++    out.push_back(s.substr(last, next - last));
+     last = next + delimiter_size;
+   }
+   if (last <= s.length()) {
+@@ -682,14 +722,18 @@ public:
+   size_t size() const { return 0; }
+   Trace operator[](size_t) const { return Trace(); }
+   size_t load_here(size_t = 0) { return 0; }
+-  size_t load_from(void *, size_t = 0) { return 0; }
++  size_t load_from(void *, size_t = 0, void * = nullptr, void * = nullptr) {
++    return 0;
++  }
+   size_t thread_id() const { return 0; }
+   void skip_n_firsts(size_t) {}
++  void *const *begin() const { return nullptr; }
+ };
+ 
+ class StackTraceImplBase {
+ public:
+-  StackTraceImplBase() : _thread_id(0), _skip(0) {}
++  StackTraceImplBase()
++      : _thread_id(0), _skip(0), _context(nullptr), _error_addr(nullptr) {}
+ 
+   size_t thread_id() const { return _thread_id; }
+ 
+@@ -717,17 +761,27 @@ protected:
+ #endif
+   }
+ 
++  void set_context(void *context) { _context = context; }
++  void *context() const { return _context; }
++
++  void set_error_addr(void *error_addr) { _error_addr = error_addr; }
++  void *error_addr() const { return _error_addr; }
++
+   size_t skip_n_firsts() const { return _skip; }
+ 
+ private:
+   size_t _thread_id;
+   size_t _skip;
++  void *_context;
++  void *_error_addr;
+ };
+ 
+ class StackTraceImplHolder : public StackTraceImplBase {
+ public:
+   size_t size() const {
+-    return _stacktrace.size() ? _stacktrace.size() - skip_n_firsts() : 0;
++    return (_stacktrace.size() >= skip_n_firsts())
++               ? _stacktrace.size() - skip_n_firsts()
++               : 0;
+   }
+   Trace operator[](size_t idx) const {
+     if (idx >= size()) {
+@@ -757,7 +811,12 @@ public:
+     _index = -1;
+     _depth = depth;
+     _Unwind_Backtrace(&this->backtrace_trampoline, this);
+-    return static_cast<size_t>(_index);
++    if (_index == -1) {
++      // _Unwind_Backtrace has failed to obtain any backtraces
++      return 0;
++    } else {
++      return static_cast<size_t>(_index);
++    }
+   }
+ 
+ private:
+@@ -778,7 +837,7 @@ private:
+     uintptr_t ip = _Unwind_GetIPInfo(ctx, &ip_before_instruction);
+ 
+     if (!ip_before_instruction) {
+-      // calculating 0-1 for unsigned, looks like a possible bug to sanitiziers,
++      // calculating 0-1 for unsigned, looks like a possible bug to sanitizers,
+       // so let's do it explicitly:
+       if (ip == 0) {
+         ip = std::numeric_limits<uintptr_t>::max(); // set it to 0xffff... (as
+@@ -808,8 +867,11 @@ template <>
+ class StackTraceImpl<system_tag::current_tag> : public StackTraceImplHolder {
+ public:
+   NOINLINE
+-  size_t load_here(size_t depth = 32) {
++  size_t load_here(size_t depth = 32, void *context = nullptr,
++                   void *error_addr = nullptr) {
+     load_thread_info();
++    set_context(context);
++    set_error_addr(error_addr);
+     if (depth == 0) {
+       return 0;
+     }
+@@ -819,8 +881,9 @@ public:
+     skip_n_firsts(0);
+     return size();
+   }
+-  size_t load_from(void *addr, size_t depth = 32) {
+-    load_here(depth + 8);
++  size_t load_from(void *addr, size_t depth = 32, void *context = nullptr,
++                   void *error_addr = nullptr) {
++    load_here(depth + 8, context, error_addr);
+ 
+     for (size_t i = 0; i < _stacktrace.size(); ++i) {
+       if (_stacktrace[i] == addr) {
+@@ -842,13 +905,193 @@ private:
+   };
+ };
+ 
++#elif BACKWARD_HAS_LIBUNWIND == 1
++
++template <>
++class StackTraceImpl<system_tag::current_tag> : public StackTraceImplHolder {
++public:
++  __attribute__((noinline)) size_t load_here(size_t depth = 32,
++                                             void *_context = nullptr,
++                                             void *_error_addr = nullptr) {
++    set_context(_context);
++    set_error_addr(_error_addr);
++    load_thread_info();
++    if (depth == 0) {
++      return 0;
++    }
++    _stacktrace.resize(depth + 1);
++
++    int result = 0;
++
++    unw_context_t ctx;
++    size_t index = 0;
++
++    // Add the tail call. If the Instruction Pointer is the crash address it
++    // means we got a bad function pointer dereference, so we "unwind" the
++    // bad pointer manually by using the return address pointed to by the
++    // Stack Pointer as the Instruction Pointer and letting libunwind do
++    // the rest
++
++    if (context()) {
++      ucontext_t *uctx = reinterpret_cast<ucontext_t *>(context());
++#ifdef REG_RIP         // x86_64
++      if (uctx->uc_mcontext.gregs[REG_RIP] ==
++          reinterpret_cast<greg_t>(error_addr())) {
++        uctx->uc_mcontext.gregs[REG_RIP] =
++            *reinterpret_cast<size_t *>(uctx->uc_mcontext.gregs[REG_RSP]);
++      }
++      _stacktrace[index] =
++          reinterpret_cast<void *>(uctx->uc_mcontext.gregs[REG_RIP]);
++      ++index;
++      ctx = *reinterpret_cast<unw_context_t *>(uctx);
++#elif defined(REG_EIP) // x86_32
++      if (uctx->uc_mcontext.gregs[REG_EIP] ==
++          reinterpret_cast<greg_t>(error_addr())) {
++        uctx->uc_mcontext.gregs[REG_EIP] =
++            *reinterpret_cast<size_t *>(uctx->uc_mcontext.gregs[REG_ESP]);
++      }
++      _stacktrace[index] =
++          reinterpret_cast<void *>(uctx->uc_mcontext.gregs[REG_EIP]);
++      ++index;
++      ctx = *reinterpret_cast<unw_context_t *>(uctx);
++#elif defined(__arm__)
++      // libunwind uses its own context type for ARM unwinding.
++      // Copy the registers from the signal handler's context so we can
++      // unwind
++      unw_getcontext(&ctx);
++      ctx.regs[UNW_ARM_R0] = uctx->uc_mcontext.arm_r0;
++      ctx.regs[UNW_ARM_R1] = uctx->uc_mcontext.arm_r1;
++      ctx.regs[UNW_ARM_R2] = uctx->uc_mcontext.arm_r2;
++      ctx.regs[UNW_ARM_R3] = uctx->uc_mcontext.arm_r3;
++      ctx.regs[UNW_ARM_R4] = uctx->uc_mcontext.arm_r4;
++      ctx.regs[UNW_ARM_R5] = uctx->uc_mcontext.arm_r5;
++      ctx.regs[UNW_ARM_R6] = uctx->uc_mcontext.arm_r6;
++      ctx.regs[UNW_ARM_R7] = uctx->uc_mcontext.arm_r7;
++      ctx.regs[UNW_ARM_R8] = uctx->uc_mcontext.arm_r8;
++      ctx.regs[UNW_ARM_R9] = uctx->uc_mcontext.arm_r9;
++      ctx.regs[UNW_ARM_R10] = uctx->uc_mcontext.arm_r10;
++      ctx.regs[UNW_ARM_R11] = uctx->uc_mcontext.arm_fp;
++      ctx.regs[UNW_ARM_R12] = uctx->uc_mcontext.arm_ip;
++      ctx.regs[UNW_ARM_R13] = uctx->uc_mcontext.arm_sp;
++      ctx.regs[UNW_ARM_R14] = uctx->uc_mcontext.arm_lr;
++      ctx.regs[UNW_ARM_R15] = uctx->uc_mcontext.arm_pc;
++
++      // If we have crashed in the PC use the LR instead, as this was
++      // a bad function dereference
++      if (reinterpret_cast<unsigned long>(error_addr()) ==
++          uctx->uc_mcontext.arm_pc) {
++        ctx.regs[UNW_ARM_R15] =
++            uctx->uc_mcontext.arm_lr - sizeof(unsigned long);
++      }
++      _stacktrace[index] = reinterpret_cast<void *>(ctx.regs[UNW_ARM_R15]);
++      ++index;
++#elif defined(__APPLE__) && defined(__x86_64__)
++      unw_getcontext(&ctx);
++      // OS X's implementation of libunwind uses its own context object
++      // so we need to convert the passed context to libunwind's format
++      // (information about the data layout taken from unw_getcontext.s
++      // in Apple's libunwind source
++      ctx.data[0] = uctx->uc_mcontext->__ss.__rax;
++      ctx.data[1] = uctx->uc_mcontext->__ss.__rbx;
++      ctx.data[2] = uctx->uc_mcontext->__ss.__rcx;
++      ctx.data[3] = uctx->uc_mcontext->__ss.__rdx;
++      ctx.data[4] = uctx->uc_mcontext->__ss.__rdi;
++      ctx.data[5] = uctx->uc_mcontext->__ss.__rsi;
++      ctx.data[6] = uctx->uc_mcontext->__ss.__rbp;
++      ctx.data[7] = uctx->uc_mcontext->__ss.__rsp;
++      ctx.data[8] = uctx->uc_mcontext->__ss.__r8;
++      ctx.data[9] = uctx->uc_mcontext->__ss.__r9;
++      ctx.data[10] = uctx->uc_mcontext->__ss.__r10;
++      ctx.data[11] = uctx->uc_mcontext->__ss.__r11;
++      ctx.data[12] = uctx->uc_mcontext->__ss.__r12;
++      ctx.data[13] = uctx->uc_mcontext->__ss.__r13;
++      ctx.data[14] = uctx->uc_mcontext->__ss.__r14;
++      ctx.data[15] = uctx->uc_mcontext->__ss.__r15;
++      ctx.data[16] = uctx->uc_mcontext->__ss.__rip;
++
++      // If the IP is the same as the crash address we have a bad function
++      // dereference The caller's address is pointed to by %rsp, so we
++      // dereference that value and set it to be the next frame's IP.
++      if (uctx->uc_mcontext->__ss.__rip ==
++          reinterpret_cast<__uint64_t>(error_addr())) {
++        ctx.data[16] =
++            *reinterpret_cast<__uint64_t *>(uctx->uc_mcontext->__ss.__rsp);
++      }
++      _stacktrace[index] = reinterpret_cast<void *>(ctx.data[16]);
++      ++index;
++#elif defined(__APPLE__)
++      unw_getcontext(&ctx)
++          // TODO: Convert the ucontext_t to libunwind's unw_context_t like
++          // we do in 64 bits
++          if (ctx.uc_mcontext->__ss.__eip ==
++              reinterpret_cast<greg_t>(error_addr())) {
++        ctx.uc_mcontext->__ss.__eip = ctx.uc_mcontext->__ss.__esp;
++      }
++      _stacktrace[index] =
++          reinterpret_cast<void *>(ctx.uc_mcontext->__ss.__eip);
++      ++index;
++#endif
++    }
++
++    unw_cursor_t cursor;
++    if (context()) {
++#if defined(UNW_INIT_SIGNAL_FRAME)
++      result = unw_init_local2(&cursor, &ctx, UNW_INIT_SIGNAL_FRAME);
++#else
++      result = unw_init_local(&cursor, &ctx);
++#endif
++    } else {
++      unw_getcontext(&ctx);
++      ;
++      result = unw_init_local(&cursor, &ctx);
++    }
++
++    if (result != 0)
++      return 1;
++
++    unw_word_t ip = 0;
++
++    while (index <= depth && unw_step(&cursor) > 0) {
++      result = unw_get_reg(&cursor, UNW_REG_IP, &ip);
++      if (result == 0) {
++        _stacktrace[index] = reinterpret_cast<void *>(--ip);
++        ++index;
++      }
++    }
++    --index;
++
++    _stacktrace.resize(index + 1);
++    skip_n_firsts(0);
++    return size();
++  }
++
++  size_t load_from(void *addr, size_t depth = 32, void *context = nullptr,
++                   void *error_addr = nullptr) {
++    load_here(depth + 8, context, error_addr);
++
++    for (size_t i = 0; i < _stacktrace.size(); ++i) {
++      if (_stacktrace[i] == addr) {
++        skip_n_firsts(i);
++        _stacktrace[i] = (void *)((uintptr_t)_stacktrace[i]);
++        break;
++      }
++    }
++
++    _stacktrace.resize(std::min(_stacktrace.size(), skip_n_firsts() + depth));
++    return size();
++  }
++};
++
+ #elif defined(BACKWARD_HAS_BACKTRACE)
+ 
+ template <>
+ class StackTraceImpl<system_tag::current_tag> : public StackTraceImplHolder {
+ public:
+   NOINLINE
+-  size_t load_here(size_t depth = 32) {
++  size_t load_here(size_t depth = 32, void *context = nullptr,
++                   void *error_addr = nullptr) {
++    set_context(context);
++    set_error_addr(error_addr);
+     load_thread_info();
+     if (depth == 0) {
+       return 0;
+@@ -860,8 +1103,9 @@ public:
+     return size();
+   }
+ 
+-  size_t load_from(void *addr, size_t depth = 32) {
+-    load_here(depth + 8);
++  size_t load_from(void *addr, size_t depth = 32, void *context = nullptr,
++                   void *error_addr = nullptr) {
++    load_here(depth + 8, context, error_addr);
+ 
+     for (size_t i = 0; i < _stacktrace.size(); ++i) {
+       if (_stacktrace[i] == addr) {
+@@ -888,8 +1132,10 @@ public:
+   void set_thread_handle(HANDLE handle) { thd_ = handle; }
+ 
+   NOINLINE
+-  size_t load_here(size_t depth = 32) {
+-
++  size_t load_here(size_t depth = 32, void *context = nullptr,
++                   void *error_addr = nullptr) {
++    set_context(static_cast<CONTEXT*>(context));
++    set_error_addr(error_addr);
+     CONTEXT localCtx; // used when no context is provided
+ 
+     if (depth == 0) {
+@@ -951,8 +1197,9 @@ public:
+     return size();
+   }
+ 
+-  size_t load_from(void *addr, size_t depth = 32) {
+-    load_here(depth + 8);
++  size_t load_from(void *addr, size_t depth = 32, void *context = nullptr,
++                   void *error_addr = nullptr) {
++    load_here(depth + 8, context, error_addr);
+ 
+     for (size_t i = 0; i < _stacktrace.size(); ++i) {
+       if (_stacktrace[i] == addr) {
+@@ -977,19 +1224,21 @@ class StackTrace : public StackTraceImpl<system_tag::current_tag> {};
+ 
+ /*************** TRACE RESOLVER ***************/
+ 
+-template <typename TAG> class TraceResolverImpl;
++class TraceResolverImplBase {
++public:
++  virtual ~TraceResolverImplBase() {}
+ 
+-#ifdef BACKWARD_SYSTEM_UNKNOWN
++  virtual void load_addresses(void *const*addresses, int address_count) {
++    (void)addresses;
++    (void)address_count;
++  }
+ 
+-template <> class TraceResolverImpl<system_tag::unknown_tag> {
+-public:
+-  template <class ST> void load_stacktrace(ST &) {}
+-  ResolvedTrace resolve(ResolvedTrace t) { return t; }
+-};
++  template <class ST> void load_stacktrace(ST &st) {
++    load_addresses(st.begin(), static_cast<int>(st.size()));
++  }
+ 
+-#endif
++  virtual ResolvedTrace resolve(ResolvedTrace t) { return t; }
+ 
+-class TraceResolverImplBase {
+ protected:
+   std::string demangle(const char *funcname) {
+     return _demangler.demangle(funcname);
+@@ -999,29 +1248,44 @@ private:
+   details::demangler _demangler;
+ };
+ 
++template <typename TAG> class TraceResolverImpl;
++
++#ifdef BACKWARD_SYSTEM_UNKNOWN
++
++template <> class TraceResolverImpl<system_tag::unknown_tag>
++    : public TraceResolverImplBase {};
++
++#endif
++
+ #ifdef BACKWARD_SYSTEM_LINUX
+ 
+-class TraceResolverLinuxBase
+-    : public TraceResolverImplBase {
++class TraceResolverLinuxBase : public TraceResolverImplBase {
+ public:
+   TraceResolverLinuxBase()
+-    : argv0_(get_argv0()), exec_path_(read_symlink("/proc/self/exe")) {
+-  }
++      : argv0_(get_argv0()), exec_path_(read_symlink("/proc/self/exe")) {}
+   std::string resolve_exec_path(Dl_info &symbol_info) const {
+-    // mutates symbol_info.dli_fname to be filename to open and returns filename to display
+-    if(symbol_info.dli_fname == argv0_) {
++    // mutates symbol_info.dli_fname to be filename to open and returns filename
++    // to display
++    if (symbol_info.dli_fname == argv0_) {
+       // dladdr returns argv[0] in dli_fname for symbols contained in
+       // the main executable, which is not a valid path if the
+       // executable was found by a search of the PATH environment
+       // variable; In that case, we actually open /proc/self/exe, which
+       // is always the actual executable (even if it was deleted/replaced!)
+       // but display the path that /proc/self/exe links to.
++      // However, this right away reduces probability of successful symbol
++      // resolution, because libbfd may try to find *.debug files in the
++      // same dir, in case symbols are stripped. As a result, it may try
++      // to find a file /proc/self/<exe_name>.debug, which obviously does
++      // not exist. /proc/self/exe is a last resort. First load attempt
++      // should go for the original executable file path.
+       symbol_info.dli_fname = "/proc/self/exe";
+       return exec_path_;
+     } else {
+       return symbol_info.dli_fname;
+     }
+   }
++
+ private:
+   std::string argv0_;
+   std::string exec_path_;
+@@ -1063,15 +1327,14 @@ template <>
+ class TraceResolverLinuxImpl<trace_resolver_tag::backtrace_symbol>
+     : public TraceResolverLinuxBase {
+ public:
+-  template <class ST> void load_stacktrace(ST &st) {
+-    using namespace details;
+-    if (st.size() == 0) {
++  void load_addresses(void *const*addresses, int address_count) override {
++    if (address_count == 0) {
+       return;
+     }
+-    _symbols.reset(backtrace_symbols(st.begin(), (int)st.size()));
++    _symbols.reset(backtrace_symbols(addresses, address_count));
+   }
+ 
+-  ResolvedTrace resolve(ResolvedTrace trace) {
++  ResolvedTrace resolve(ResolvedTrace trace) override {
+     char *filename = _symbols[trace.idx];
+     char *funcname = filename;
+     while (*funcname && *funcname != '(') {
+@@ -1108,9 +1371,7 @@ class TraceResolverLinuxImpl<trace_resolver_tag::libbfd>
+ public:
+   TraceResolverLinuxImpl() : _bfd_loaded(false) {}
+ 
+-  template <class ST> void load_stacktrace(ST &) {}
+-
+-  ResolvedTrace resolve(ResolvedTrace trace) {
++  ResolvedTrace resolve(ResolvedTrace trace) override {
+     Dl_info symbol_info;
+ 
+     // trace.addr is a virtual address in memory pointing to some code.
+@@ -1140,9 +1401,45 @@ public:
+     }
+ 
+     trace.object_filename = resolve_exec_path(symbol_info);
+-    bfd_fileobject &fobj = load_object_with_bfd(symbol_info.dli_fname);
+-    if (!fobj.handle) {
+-      return trace; // sad, we couldn't load the object :(
++    bfd_fileobject *fobj;
++    // Before rushing to resolution need to ensure the executable
++    // file still can be used. For that compare inode numbers of
++    // what is stored by the executable's file path, and in the
++    // dli_fname, which not necessarily equals to the executable.
++    // It can be a shared library, or /proc/self/exe, and in the
++    // latter case has drawbacks. See the exec path resolution for
++    // details. In short - the dli object should be used only as
++    // the last resort.
++    // If inode numbers are equal, it is known dli_fname and the
++    // executable file are the same. This is guaranteed by Linux,
++    // because if the executable file is changed/deleted, it will
++    // be done in a new inode. The old file will be preserved in
++    // /proc/self/exe, and may even have inode 0. The latter can
++    // happen if the inode was actually reused, and the file was
++    // kept only in the main memory.
++    //
++    struct stat obj_stat;
++    struct stat dli_stat;
++    if (stat(trace.object_filename.c_str(), &obj_stat) == 0 &&
++        stat(symbol_info.dli_fname, &dli_stat) == 0 &&
++        obj_stat.st_ino == dli_stat.st_ino) {
++      // The executable file, and the shared object containing the
++      // address are the same file. Safe to use the original path.
++      // this is preferable. Libbfd will search for stripped debug
++      // symbols in the same directory.
++      fobj = load_object_with_bfd(trace.object_filename);
++    } else{
++      // The original object file was *deleted*! The only hope is
++      // that the debug symbols are either inside the shared
++      // object file, or are in the same directory, and this is
++      // not /proc/self/exe.
++      fobj = nullptr;
++    }
++    if (fobj == nullptr || !fobj->handle) {
++      fobj = load_object_with_bfd(symbol_info.dli_fname);
++      if (!fobj->handle) {
++        return trace;
++      }
+     }
+ 
+     find_sym_result *details_selected; // to be filled.
+@@ -1162,7 +1459,7 @@ public:
+     // line of the function that was called. But if the code is optimized,
+     // we might get something absolutely not related since the compiler
+     // can reschedule the return address with inline functions and
+-    // tail-call optimisation (among other things that I don't even know
++    // tail-call optimization (among other things that I don't even know
+     // or cannot even dream about with my tiny limited brain).
+     find_sym_result details_adjusted_call_site = find_symbol_details(
+         fobj, (void *)(uintptr_t(trace.addr) - 1), symbol_info.dli_fbase);
+@@ -1193,7 +1490,7 @@ public:
+         // this time we get the name of the function where the code is
+         // located, instead of the function were the address is
+         // located. In short, if the code was inlined, we get the
+-        // function correspoding to the code. Else we already got in
++        // function corresponding to the code. Else we already got in
+         // trace.function.
+         trace.source.function = demangle(details_selected->funcname);
+ 
+@@ -1277,7 +1574,7 @@ private:
+   typedef details::hashtable<std::string, bfd_fileobject>::type fobj_bfd_map_t;
+   fobj_bfd_map_t _fobj_bfd_map;
+ 
+-  bfd_fileobject &load_object_with_bfd(const std::string &filename_object) {
++  bfd_fileobject *load_object_with_bfd(const std::string &filename_object) {
+     using namespace details;
+ 
+     if (!_bfd_loaded) {
+@@ -1288,11 +1585,11 @@ private:
+ 
+     fobj_bfd_map_t::iterator it = _fobj_bfd_map.find(filename_object);
+     if (it != _fobj_bfd_map.end()) {
+-      return it->second;
++      return &it->second;
+     }
+ 
+     // this new object is empty for now.
+-    bfd_fileobject &r = _fobj_bfd_map[filename_object];
++    bfd_fileobject *r = &_fobj_bfd_map[filename_object];
+ 
+     // we do the work temporary in this one;
+     bfd_handle_t bfd_handle;
+@@ -1341,9 +1638,9 @@ private:
+       return r; // damned, that's a stripped file that you got there!
+     }
+ 
+-    r.handle = move(bfd_handle);
+-    r.symtab = move(symtab);
+-    r.dynamic_symtab = move(dynamic_symtab);
++    r->handle = move(bfd_handle);
++    r->symtab = move(symtab);
++    r->dynamic_symtab = move(dynamic_symtab);
+     return r;
+   }
+ 
+@@ -1362,15 +1659,15 @@ private:
+     find_sym_result result;
+   };
+ 
+-  find_sym_result find_symbol_details(bfd_fileobject &fobj, void *addr,
++  find_sym_result find_symbol_details(bfd_fileobject *fobj, void *addr,
+                                       void *base_addr) {
+     find_sym_context context;
+     context.self = this;
+-    context.fobj = &fobj;
++    context.fobj = fobj;
+     context.addr = addr;
+     context.base_addr = base_addr;
+     context.result.found = false;
+-    bfd_map_over_sections(fobj.handle.get(), &find_in_section_trampoline,
++    bfd_map_over_sections(fobj->handle.get(), &find_in_section_trampoline,
+                           static_cast<void *>(&context));
+     return context.result;
+   }
+@@ -1379,24 +1676,24 @@ private:
+     find_sym_context *context = static_cast<find_sym_context *>(data);
+     context->self->find_in_section(
+         reinterpret_cast<bfd_vma>(context->addr),
+-        reinterpret_cast<bfd_vma>(context->base_addr), *context->fobj, section,
++        reinterpret_cast<bfd_vma>(context->base_addr), context->fobj, section,
+         context->result);
+   }
+ 
+-  void find_in_section(bfd_vma addr, bfd_vma base_addr, bfd_fileobject &fobj,
++  void find_in_section(bfd_vma addr, bfd_vma base_addr, bfd_fileobject *fobj,
+                        asection *section, find_sym_result &result) {
+     if (result.found)
+       return;
+ 
+ #ifdef bfd_get_section_flags
+-    if ((bfd_get_section_flags(fobj.handle.get(), section) & SEC_ALLOC) == 0)
++    if ((bfd_get_section_flags(fobj->handle.get(), section) & SEC_ALLOC) == 0)
+ #else
+     if ((bfd_section_flags(section) & SEC_ALLOC) == 0)
+ #endif
+       return; // a debug section is never loaded automatically.
+ 
+ #ifdef bfd_get_section_vma
+-    bfd_vma sec_addr = bfd_get_section_vma(fobj.handle.get(), section);
++    bfd_vma sec_addr = bfd_get_section_vma(fobj->handle.get(), section);
+ #else
+     bfd_vma sec_addr = bfd_section_vma(section);
+ #endif
+@@ -1408,7 +1705,7 @@ private:
+ 
+     // are we in the boundaries of the section?
+     if (addr < sec_addr || addr >= sec_addr + size) {
+-      addr -= base_addr; // oups, a relocated object, lets try again...
++      addr -= base_addr; // oops, a relocated object, lets try again...
+       if (addr < sec_addr || addr >= sec_addr + size) {
+         return;
+       }
+@@ -1418,15 +1715,15 @@ private:
+ #pragma clang diagnostic push
+ #pragma clang diagnostic ignored "-Wzero-as-null-pointer-constant"
+ #endif
+-    if (!result.found && fobj.symtab) {
++    if (!result.found && fobj->symtab) {
+       result.found = bfd_find_nearest_line(
+-          fobj.handle.get(), section, fobj.symtab.get(), addr - sec_addr,
++          fobj->handle.get(), section, fobj->symtab.get(), addr - sec_addr,
+           &result.filename, &result.funcname, &result.line);
+     }
+ 
+-    if (!result.found && fobj.dynamic_symtab) {
++    if (!result.found && fobj->dynamic_symtab) {
+       result.found = bfd_find_nearest_line(
+-          fobj.handle.get(), section, fobj.dynamic_symtab.get(),
++          fobj->handle.get(), section, fobj->dynamic_symtab.get(),
+           addr - sec_addr, &result.filename, &result.funcname, &result.line);
+     }
+ #if defined(__clang__)
+@@ -1435,13 +1732,13 @@ private:
+   }
+ 
+   ResolvedTrace::source_locs_t
+-  backtrace_inliners(bfd_fileobject &fobj, find_sym_result previous_result) {
++  backtrace_inliners(bfd_fileobject *fobj, find_sym_result previous_result) {
+     // This function can be called ONLY after a SUCCESSFUL call to
+     // find_symbol_details. The state is global to the bfd_handle.
+     ResolvedTrace::source_locs_t results;
+     while (previous_result.found) {
+       find_sym_result result;
+-      result.found = bfd_find_inliner_info(fobj.handle.get(), &result.filename,
++      result.found = bfd_find_inliner_info(fobj->handle.get(), &result.filename,
+                                            &result.funcname, &result.line);
+ 
+       if (result
+@@ -1484,12 +1781,10 @@ class TraceResolverLinuxImpl<trace_resolver_tag::libdw>
+ public:
+   TraceResolverLinuxImpl() : _dwfl_handle_initialized(false) {}
+ 
+-  template <class ST> void load_stacktrace(ST &) {}
+-
+-  ResolvedTrace resolve(ResolvedTrace trace) {
++  ResolvedTrace resolve(ResolvedTrace trace) override {
+     using namespace details;
+ 
+-    Dwarf_Addr trace_addr = (Dwarf_Addr)trace.addr;
++    Dwarf_Addr trace_addr = reinterpret_cast<Dwarf_Addr>(trace.addr);
+ 
+     if (!_dwfl_handle_initialized) {
+       // initialize dwfl...
+@@ -1621,8 +1916,8 @@ public:
+       int line = 0, col = 0;
+       dwarf_lineno(srcloc, &line);
+       dwarf_linecol(srcloc, &col);
+-      trace.source.line = line;
+-      trace.source.col = col;
++      trace.source.line = static_cast<unsigned>(line);
++      trace.source.col = static_cast<unsigned>(col);
+     }
+ 
+     deep_first_search_by_pc(cudie, trace_addr - mod_bias,
+@@ -1669,8 +1964,8 @@ private:
+         Dwarf_Word line = 0, col = 0;
+         dwarf_formudata(dwarf_attr(die, DW_AT_call_line, &attr_mem), &line);
+         dwarf_formudata(dwarf_attr(die, DW_AT_call_column, &attr_mem), &col);
+-        sloc.line = (unsigned)line;
+-        sloc.col = (unsigned)col;
++        sloc.line = static_cast<unsigned>(line);
++        sloc.col = static_cast<unsigned>(col);
+ 
+         trace.inliners.push_back(sloc);
+         break;
+@@ -1779,9 +2074,9 @@ private:
+ 
+   static const char *die_call_file(Dwarf_Die *die) {
+     Dwarf_Attribute attr_mem;
+-    Dwarf_Sword file_idx = 0;
++    Dwarf_Word file_idx = 0;
+ 
+-    dwarf_formsdata(dwarf_attr(die, DW_AT_call_file, &attr_mem), &file_idx);
++    dwarf_formudata(dwarf_attr(die, DW_AT_call_file, &attr_mem), &file_idx);
+ 
+     if (file_idx == 0) {
+       return 0;
+@@ -1813,9 +2108,7 @@ class TraceResolverLinuxImpl<trace_resolver_tag::libdwarf>
+ public:
+   TraceResolverLinuxImpl() : _dwarf_loaded(false) {}
+ 
+-  template <class ST> void load_stacktrace(ST &) {}
+-
+-  ResolvedTrace resolve(ResolvedTrace trace) {
++  ResolvedTrace resolve(ResolvedTrace trace) override {
+     // trace.addr is a virtual address in memory pointing to some code.
+     // Let's try to find from which loaded object it comes from.
+     // The loaded object can be yourself btw.
+@@ -2831,7 +3124,7 @@ private:
+             trace.object_function = demangler.demangle(linkage);
+             dwarf_dealloc(dwarf, linkage, DW_DLA_STRING);
+           }
+-          dwarf_dealloc(dwarf, name, DW_DLA_ATTR);
++          dwarf_dealloc(dwarf, attr_mem, DW_DLA_ATTR);
+         }
+         break;
+ 
+@@ -3039,12 +3332,12 @@ private:
+                                    Dwarf_Die cu_die) {
+     Dwarf_Attribute attr_mem;
+     Dwarf_Error error = DW_DLE_NE;
+-    Dwarf_Signed file_index;
++    Dwarf_Unsigned file_index;
+ 
+     std::string file;
+ 
+     if (dwarf_attr(die, DW_AT_call_file, &attr_mem, &error) == DW_DLV_OK) {
+-      if (dwarf_formsdata(attr_mem, &file_index, &error) != DW_DLV_OK) {
++      if (dwarf_formudata(attr_mem, &file_index, &error) != DW_DLV_OK) {
+         file_index = 0;
+       }
+       dwarf_dealloc(dwarf, attr_mem, DW_DLA_ATTR);
+@@ -3056,8 +3349,9 @@ private:
+       char **srcfiles = 0;
+       Dwarf_Signed file_count = 0;
+       if (dwarf_srcfiles(cu_die, &srcfiles, &file_count, &error) == DW_DLV_OK) {
+-        if (file_index <= file_count)
++        if (file_count > 0 && file_index <= static_cast<Dwarf_Unsigned>(file_count)) {
+           file = std::string(srcfiles[file_index - 1]);
++	}
+ 
+         // Deallocate all strings!
+         for (int i = 0; i < file_count; ++i) {
+@@ -3194,15 +3488,14 @@ template <>
+ class TraceResolverDarwinImpl<trace_resolver_tag::backtrace_symbol>
+     : public TraceResolverImplBase {
+ public:
+-  template <class ST> void load_stacktrace(ST &st) {
+-    using namespace details;
+-    if (st.size() == 0) {
++  void load_addresses(void *const*addresses, int address_count) override {
++    if (address_count == 0) {
+       return;
+     }
+-    _symbols.reset(backtrace_symbols(st.begin(), st.size()));
++    _symbols.reset(backtrace_symbols(addresses, address_count));
+   }
+ 
+-  ResolvedTrace resolve(ResolvedTrace trace) {
++  ResolvedTrace resolve(ResolvedTrace trace) override {
+     // parse:
+     // <n>  <file>  <addr>  <mangled-name> + <offset>
+     char *filename = _symbols[trace.idx];
+@@ -3300,9 +3593,9 @@ public:
+     ret.base_address = mi.lpBaseOfDll;
+     ret.load_size = mi.SizeOfImage;
+ 
+-    GetModuleFileNameEx(process, module, temp, sizeof(temp));
++    GetModuleFileNameExA(process, module, temp, sizeof(temp));
+     ret.image_name = temp;
+-    GetModuleBaseName(process, module, temp, sizeof(temp));
++    GetModuleBaseNameA(process, module, temp, sizeof(temp));
+     ret.module_name = temp;
+     std::vector<char> img(ret.image_name.begin(), ret.image_name.end());
+     std::vector<char> mod(ret.module_name.begin(), ret.module_name.end());
+@@ -3312,7 +3605,8 @@ public:
+   }
+ };
+ 
+-template <> class TraceResolverImpl<system_tag::windows_tag> {
++template <> class TraceResolverImpl<system_tag::windows_tag>
++    : public TraceResolverImplBase {
+ public:
+   TraceResolverImpl() {
+ 
+@@ -3326,10 +3620,12 @@ public:
+     symOptions |= SYMOPT_LOAD_LINES | SYMOPT_UNDNAME;
+     SymSetOptions(symOptions);
+     EnumProcessModules(process, &module_handles[0],
+-                       module_handles.size() * sizeof(HMODULE), &cbNeeded);
++                       static_cast<DWORD>(module_handles.size() * sizeof(HMODULE)),
++		       &cbNeeded);
+     module_handles.resize(cbNeeded / sizeof(HMODULE));
+     EnumProcessModules(process, &module_handles[0],
+-                       module_handles.size() * sizeof(HMODULE), &cbNeeded);
++                       static_cast<DWORD>(module_handles.size() * sizeof(HMODULE)),
++		       &cbNeeded);
+     std::transform(module_handles.begin(), module_handles.end(),
+                    std::back_inserter(modules), get_mod_info(process));
+     void *base = modules[0].base_address;
+@@ -3337,8 +3633,6 @@ public:
+     image_type = h->FileHeader.Machine;
+   }
+ 
+-  template <class ST> void load_stacktrace(ST &) {}
+-
+   static const int max_sym_len = 255;
+   struct symbol_t {
+     SYMBOL_INFO sym;
+@@ -3347,27 +3641,28 @@ public:
+ 
+   DWORD64 displacement;
+ 
+-  ResolvedTrace resolve(ResolvedTrace t) {
++  ResolvedTrace resolve(ResolvedTrace t) override {
+     HANDLE process = GetCurrentProcess();
+ 
+     char name[256];
+ 
+-    memset(&sym, sizeof(sym), 0);
++    memset(&sym, 0, sizeof(sym));
+     sym.sym.SizeOfStruct = sizeof(SYMBOL_INFO);
+     sym.sym.MaxNameLen = max_sym_len;
+ 
+     if (!SymFromAddr(process, (ULONG64)t.addr, &displacement, &sym.sym)) {
+       // TODO:  error handling everywhere
+-      LPTSTR lpMsgBuf;
++      char* lpMsgBuf;
+       DWORD dw = GetLastError();
+ 
+-      FormatMessage(FORMAT_MESSAGE_ALLOCATE_BUFFER |
+-                        FORMAT_MESSAGE_FROM_SYSTEM |
+-                        FORMAT_MESSAGE_IGNORE_INSERTS,
+-                    NULL, dw, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+-                    (LPTSTR)&lpMsgBuf, 0, NULL);
+-
+-      printf(lpMsgBuf);
++      if (FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER |
++                             FORMAT_MESSAGE_FROM_SYSTEM |
++                             FORMAT_MESSAGE_IGNORE_INSERTS,
++                         NULL, dw, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
++                         (char*)&lpMsgBuf, 0, NULL)) {
++        std::fprintf(stderr, "%s\n", lpMsgBuf);
++        LocalFree(lpMsgBuf);
++      }
+ 
+       // abort();
+     }
+@@ -3410,12 +3705,13 @@ public:
+     // 1. If BACKWARD_CXX_SOURCE_PREFIXES is set then assume it contains
+     //    a colon-separated list of path prefixes.  Try prepending each
+     //    to the given path until a valid file is found.
+-    const std::vector<std::string>& prefixes = get_paths_from_env_variable();
++    const std::vector<std::string> &prefixes = get_paths_from_env_variable();
+     for (size_t i = 0; i < prefixes.size(); ++i) {
+       // Double slashes (//) should not be a problem.
+       std::string new_path = prefixes[i] + '/' + path;
+       _file.reset(new std::ifstream(new_path.c_str()));
+-      if (is_open()) break;
++      if (is_open())
++        break;
+     }
+     // 2. If no valid file found then fallback to opening the path as-is.
+     if (!_file || !is_open()) {
+@@ -3513,22 +3809,33 @@ public:
+   }
+ #endif
+ 
++  // Allow adding to paths gotten from BACKWARD_CXX_SOURCE_PREFIXES after loading the
++  // library; this can be useful when the library is loaded when the locations are unknown
++  // Warning: Because this edits the static paths variable, it is *not* intrinsiclly thread safe
++  static void add_paths_to_env_variable_impl(const std::string & to_add) {
++    get_mutable_paths_from_env_variable().push_back(to_add);
++  }
++
+ private:
+   details::handle<std::ifstream *, details::default_delete<std::ifstream *> >
+       _file;
+ 
+-  std::vector<std::string> get_paths_from_env_variable_impl() {
++  static std::vector<std::string> get_paths_from_env_variable_impl() {
+     std::vector<std::string> paths;
+-    const char* prefixes_str = std::getenv("BACKWARD_CXX_SOURCE_PREFIXES");
++    const char *prefixes_str = std::getenv("BACKWARD_CXX_SOURCE_PREFIXES");
+     if (prefixes_str && prefixes_str[0]) {
+       paths = details::split_source_prefixes(prefixes_str);
+     }
+     return paths;
+   }
+ 
+-  const std::vector<std::string>& get_paths_from_env_variable() {
+-    static std::vector<std::string> paths = get_paths_from_env_variable_impl();
+-    return paths;
++  static std::vector<std::string> &get_mutable_paths_from_env_variable() {
++    static volatile std::vector<std::string> paths = get_paths_from_env_variable_impl();
++    return const_cast<std::vector<std::string>&>(paths);
++  }
++
++  static const std::vector<std::string> &get_paths_from_env_variable() {
++    return get_mutable_paths_from_env_variable();
+   }
+ 
+ #ifdef BACKWARD_ATLEAST_CXX11
+@@ -3605,7 +3912,7 @@ public:
+   cfile_streambuf(FILE *_sink) : sink(_sink) {}
+   int_type underflow() override { return traits_type::eof(); }
+   int_type overflow(int_type ch) override {
+-    if (traits_type::not_eof(ch) && fwrite(&ch, sizeof ch, 1, sink) == 1) {
++    if (traits_type::not_eof(ch) && fputc(ch, sink) != EOF) {
+       return ch;
+     }
+     return traits_type::eof();
+@@ -3696,10 +4003,12 @@ public:
+   bool object;
+   int inliner_context_size;
+   int trace_context_size;
++  bool reverse;
+ 
+   Printer()
+       : snippet(true), color_mode(ColorMode::automatic), address(false),
+-        object(false), inliner_context_size(5), trace_context_size(7) {}
++        object(false), inliner_context_size(5), trace_context_size(7),
++        reverse(true) {}
+ 
+   template <typename ST> FILE *print(ST &st, FILE *fp = stderr) {
+     cfile_streambuf obuf(fp);
+@@ -3746,8 +4055,14 @@ private:
+   void print_stacktrace(ST &st, std::ostream &os, Colorize &colorize) {
+     print_header(os, st.thread_id());
+     _resolver.load_stacktrace(st);
+-    for (size_t trace_idx = st.size(); trace_idx > 0; --trace_idx) {
+-      print_trace(os, _resolver.resolve(st[trace_idx - 1]), colorize);
++    if ( reverse ) {
++      for (size_t trace_idx = st.size(); trace_idx > 0; --trace_idx) {
++        print_trace(os, _resolver.resolve(st[trace_idx - 1]), colorize);
++      }
++    } else {
++      for (size_t trace_idx = 0; trace_idx < st.size(); ++trace_idx) {
++        print_trace(os, _resolver.resolve(st[trace_idx]), colorize);
++      }
+     }
+   }
+ 
+@@ -3928,16 +4243,19 @@ public:
+ #elif defined(__arm__)
+     error_addr = reinterpret_cast<void *>(uctx->uc_mcontext.arm_pc);
+ #elif defined(__aarch64__)
+-   #if defined(__APPLE__)
+-     error_addr = reinterpret_cast<void *>(uctx->uc_mcontext->__ss.__pc);
+-   #else
+-     error_addr = reinterpret_cast<void *>(uctx->uc_mcontext.pc);
+-   #endif
++    #if defined(__APPLE__)
++      error_addr = reinterpret_cast<void *>(uctx->uc_mcontext->__ss.__pc);
++    #else
++      error_addr = reinterpret_cast<void *>(uctx->uc_mcontext.pc);
++    #endif
+ #elif defined(__mips__)
+-    error_addr = reinterpret_cast<void *>(reinterpret_cast<struct sigcontext*>(&uctx->uc_mcontext)->sc_pc);
++    error_addr = reinterpret_cast<void *>(
++        reinterpret_cast<struct sigcontext *>(&uctx->uc_mcontext)->sc_pc);
+ #elif defined(__ppc__) || defined(__powerpc) || defined(__powerpc__) ||        \
+     defined(__POWERPC__)
+     error_addr = reinterpret_cast<void *>(uctx->uc_mcontext.regs->nip);
++#elif defined(__riscv)
++    error_addr = reinterpret_cast<void *>(uctx->uc_mcontext.__gregs[REG_PC]);
+ #elif defined(__s390x__)
+     error_addr = reinterpret_cast<void *>(uctx->uc_mcontext.psw.addr);
+ #elif defined(__APPLE__) && defined(__x86_64__)
+@@ -3948,16 +4266,18 @@ public:
+ #warning ":/ sorry, ain't know no nothing none not of your architecture!"
+ #endif
+     if (error_addr) {
+-      st.load_from(error_addr, 32);
++      st.load_from(error_addr, 32, reinterpret_cast<void *>(uctx),
++                   info->si_addr);
+     } else {
+-      st.load_here(32);
++      st.load_here(32, reinterpret_cast<void *>(uctx), info->si_addr);
+     }
+ 
+     Printer printer;
+     printer.address = true;
+     printer.print(st, stderr);
+ 
+-#if _XOPEN_SOURCE >= 700 || _POSIX_C_SOURCE >= 200809L
++#if (defined(_XOPEN_SOURCE) && _XOPEN_SOURCE >= 700) || \
++    (defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200809L)
+     psiginfo(info, nullptr);
+ #else
+     (void)info;
+@@ -4018,8 +4338,10 @@ public:
+     signal(SIGABRT, signal_handler);
+     _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+ 
+-    set_terminate(&terminator);
+-    set_unexpected(&terminator);
++    std::set_terminate(&terminator);
++#ifndef BACKWARD_ATLEAST_CXX17
++    std::set_unexpected(&terminator);
++#endif
+     _set_purecall_handler(&terminator);
+     _set_invalid_parameter_handler(&invalid_parameter_handler);
+   }
+@@ -4070,7 +4392,7 @@ private:
+   static const constexpr int signal_skip_recs =
+ #ifdef __clang__
+       // With clang, RtlCaptureContext also captures the stack frame of the
+-      // current function Below that, there ar 3 internal Windows functions
++      // current function Below that, there are 3 internal Windows functions
+       4
+ #else
+       // With MSVC cl, RtlCaptureContext misses the stack frame of the current
+@@ -4147,9 +4469,8 @@ private:
+ 
+     StackTrace st;
+     st.set_machine_type(printer.resolver().machine_type());
+-    st.set_context(ctx());
+     st.set_thread_handle(thread_handle());
+-    st.load_here(32 + skip_frames);
++    st.load_here(32 + skip_frames, ctx());
+     st.skip_n_firsts(skip_frames);
+ 
+     printer.address = true;
+-- 
+2.41.0
+
