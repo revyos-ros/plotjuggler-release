@@ -1,4 +1,4 @@
-From 826282fa0ec2d028d79a8466401540f5e62b3484 Mon Sep 17 00:00:00 2001
+From 7953550cad15942db96b28273f033319a6ba26a3 Mon Sep 17 00:00:00 2001
 From: Zheng Junjie <zhengjunjie@iscas.ac.cn>
 Date: Wed, 19 Jun 2024 10:03:46 +0800
 Subject: [PATCH] add update-3rdparty-backward-cpp patch.
