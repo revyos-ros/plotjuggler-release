@@ -91,7 +91,7 @@ MainWindow::MainWindow(const QCommandLineParser& commandline_parser, QWidget* pa
   if (commandline_parser.isSet("enabled_plugins"))
   {
     _enabled_plugins =
-        commandline_parser.value("enabled_plugins").split(";", QString::SkipEmptyParts);
+        commandline_parser.value("enabled_plugins").split(";", PJ::SkipEmptyParts);
     // Treat the command-line parameter  '--enabled_plugins *' to mean all plugings are
     // enabled
     if ((_enabled_plugins.size() == 1) && (_enabled_plugins.contains("*")))
@@ -102,7 +102,7 @@ MainWindow::MainWindow(const QCommandLineParser& commandline_parser, QWidget* pa
   if (commandline_parser.isSet("disabled_plugins"))
   {
     _disabled_plugins =
-        commandline_parser.value("disabled_plugins").split(";", QString::SkipEmptyParts);
+        commandline_parser.value("disabled_plugins").split(";", PJ::SkipEmptyParts);
   }
 
   _curvelist_widget = new CurveListPanel(_mapped_plot_data, _transform_functions, this);
@@ -240,7 +240,7 @@ MainWindow::MainWindow(const QCommandLineParser& commandline_parser, QWidget* pa
 
   //------------ Load plugins -------------
   auto plugin_extra_folders =
-      commandline_parser.value("plugin_folders").split(";", QString::SkipEmptyParts);
+      commandline_parser.value("plugin_folders").split(";", PJ::SkipEmptyParts);
 
   _default_streamer = commandline_parser.value("start_streamer");
 
@@ -623,7 +623,9 @@ QStringList MainWindow::initializePlugins(QString directory_name)
     }
     catch (std::runtime_error& err)
     {
-      qDebug() << QString("%1: skipping, because it threw the following exception: %2").arg(filename).arg(err.what());
+      qDebug() << QString("%1: skipping, because it threw the following exception: %2")
+                      .arg(filename)
+                      .arg(err.what());
       continue;
     }
     if (plugin && dynamic_cast<PlotJugglerPlugin*>(plugin))
@@ -760,7 +762,7 @@ QStringList MainWindow::initializePlugins(QString directory_name)
       {
         QStringList encodings = QString(message_parser->encoding()).split(";");
         auto parser_ptr = std::shared_ptr<ParserFactoryPlugin>(message_parser);
-        for(const QString& encoding: encodings)
+        for (const QString& encoding : encodings)
         {
           _parser_factories[encoding] = parser_ptr;
         }
@@ -826,18 +828,19 @@ QStringList MainWindow::initializePlugins(QString directory_name)
                   updateDataAndReplot(true);
                 });
 
-        connect(toolbox, &ToolboxPlugin::plotCreated, this, [=](std::string name, bool is_custom) {
-          if (is_custom)
-          {
-            _curvelist_widget->addCustom(QString::fromStdString(name));
-          }
-          else
-          {
-            _curvelist_widget->addCurve(name);
-          }
-          _curvelist_widget->updateAppearance();
-          _curvelist_widget->clearSelections();
-        });
+        connect(toolbox, &ToolboxPlugin::plotCreated, this,
+                [=](std::string name, bool is_custom) {
+                  if (is_custom)
+                  {
+                    _curvelist_widget->addCustom(QString::fromStdString(name));
+                  }
+                  else
+                  {
+                    _curvelist_widget->addCurve(name);
+                  }
+                  _curvelist_widget->updateAppearance();
+                  _curvelist_widget->clearSelections();
+                });
       }
     }
     else
@@ -1412,7 +1415,7 @@ bool MainWindow::loadDataFromFiles(QStringList filenames)
   {
     data_replaced_entirely = true;
   }
-  else if(!ui->checkBoxAddPrefixAndMerge->isChecked())
+  else if (!ui->checkBoxAddPrefixAndMerge->isChecked())
   {
     QMessageBox::StandardButton reply;
     reply = QMessageBox::question(
@@ -1505,7 +1508,8 @@ std::unordered_set<std::string> MainWindow::loadDataFromFile(const FileLoadInfo&
     QString plugin_name =
         QInputDialog::getItem(this, tr("QInputDialog::getItem()"),
                               tr("Select the loader to use:"), names, 0, false, &ok);
-    if (ok && !plugin_name.isEmpty() && (_enabled_plugins.size() == 0 || _enabled_plugins.contains(plugin_name)))
+    if (ok && !plugin_name.isEmpty() &&
+        (_enabled_plugins.size() == 0 || _enabled_plugins.contains(plugin_name)))
     {
       dataloader = _data_loader[plugin_name];
       last_plugin_name_used = plugin_name;
@@ -1786,7 +1790,7 @@ void MainWindow::setStatusBarMessage(QString message)
 {
   ui->statusLabel->setText(message);
   ui->widgetStatusBar->setHidden(message.isEmpty());
-  QTimer::singleShot( 7000, this, [this]() { ui->widgetStatusBar->setHidden(true); } );
+  QTimer::singleShot(7000, this, [this]() { ui->widgetStatusBar->setHidden(true); });
 }
 
 void MainWindow::loadStyleSheet(QString file_path)
@@ -2418,7 +2422,14 @@ void MainWindow::updateDataAndReplot(bool replot_hidden_tabs)
       _curvelist_widget->refreshColumns();
     }
 
-    _mapped_plot_data.setMaximumRangeX(ui->streamingSpinBox->value());
+    if (ui->streamingSpinBox->value() == ui->streamingSpinBox->maximum())
+    {
+      _mapped_plot_data.setMaximumRangeX(std::numeric_limits<double>::max());
+    }
+    else
+    {
+      _mapped_plot_data.setMaximumRangeX(ui->streamingSpinBox->value());
+    }
   }
 
   const bool is_streaming_active = isStreamingActive();
@@ -2469,6 +2480,18 @@ void MainWindow::updateDataAndReplot(bool replot_hidden_tabs)
 void MainWindow::on_streamingSpinBox_valueChanged(int value)
 {
   double real_value = value;
+
+  if (value == ui->streamingSpinBox->maximum())
+  {
+    real_value = std::numeric_limits<double>::max();
+    ui->streamingSpinBox->setStyleSheet("QSpinBox { color: red; }");
+    ui->streamingSpinBox->setSuffix("=inf");
+  }
+  else
+  {
+    ui->streamingSpinBox->setStyleSheet("QSpinBox { color: black; }");
+    ui->streamingSpinBox->setSuffix(" sec");
+  }
 
   if (isStreamingActive() == false)
   {
@@ -3192,7 +3215,7 @@ void MainWindow::on_buttonSaveLayout_clicked()
   if (file.open(QIODevice::WriteOnly))
   {
     QTextStream stream(&file);
-    stream << doc.toString() << endl;
+    stream << doc.toString() << "\n";
   }
 }
 
@@ -3510,16 +3533,14 @@ void MainWindow::on_buttonReloadData_clicked()
 {
   const auto prev_infos = std::move(_loaded_datafiles_previous);
   _loaded_datafiles_previous.clear();
-  for(const auto& info: prev_infos)
+  for (const auto& info : prev_infos)
   {
     loadDataFromFile(info);
   }
   ui->buttonReloadData->setEnabled(!_loaded_datafiles_previous.empty());
 }
 
-
 void MainWindow::on_buttonCloseStatus_clicked()
 {
   ui->widgetStatusBar->hide();
 }
-
