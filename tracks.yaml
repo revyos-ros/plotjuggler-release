@@ -1,4 +1,4 @@
-release_repo_url: git@github.com:revyos-ros/plotjuggler-release
+release_repo_url: git@github.com:revyos-ros/plotjuggler-release.git
 tracks:
   eloquent:
     actions:
